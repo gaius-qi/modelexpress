@@ -249,34 +249,19 @@ status:
 
 ## Client Workflow
 
-### Source Path (load from disk, publish metadata)
+The `MxModelLoader` evaluates strategies in priority order (`RdmaStrategy` -> `ModelStreamerStrategy` -> `GdsStrategy` -> `DefaultStrategy`) and runs the first available one. The four diagrams below describe the per-strategy flow. Every diagram shares the same five participants so the boundaries between modules are explicit:
 
-```mermaid
-sequenceDiagram
-    participant Engine as Inference Engine
-    participant Client as ModelExpress Client
-    participant Server as ModelExpress Server
-    participant Storage as Storage Origin (HuggingFace / S3)
+1. **Inference Engine** -- vLLM (or other host) calling `load_model`
+2. **ModelExpress Client** -- in-process Python loader, NIXL agent, gRPC client
+3. **ModelExpress Server** -- central metadata service (Redis or Kubernetes backend)
+4. **Remote ModelExpress Worker** -- another worker that already published metadata as an RDMA source
+5. **Storage Origin** -- HuggingFace Hub, S3, GCS, Azure Blob, or local disk
 
-    Engine->>Client: load_model(model_name, identity)
-    Client->>Storage: Fetch weights (HF Hub / S3 / GCS / Azure)
-    Storage-->>Client: Model files (safetensors)
-    Client->>Client: Load tensors to GPU (ModelStreamer / GDS / disk)
-    Client->>Engine: process_weights_after_loading()
-    Engine-->>Client: Post-processed tensors
-    Client->>Client: Initialize NIXL agent, register tensors
-    Client->>Server: PublishMetadata(identity, worker, worker_id)
-    Server->>Server: Store worker metadata (status=INITIALIZING)
-    Server-->>Client: mx_source_id
-    Client->>Client: Start HeartbeatThread
-    loop Every MX_HEARTBEAT_INTERVAL_SECS
-        Client->>Server: UpdateStatus(mx_source_id, worker_id, rank, READY)
-        Server->>Server: Patch status + updated_at
-    end
-    Client-->>Engine: Model ready for inference
-```
+When a strategy does not interact with a given module, that lifeline simply has no messages on it.
 
-### Target Path (receive via RDMA)
+### DefaultStrategy (vLLM `DefaultModelLoader`, CPU-staged + HF Hub download)
+
+Activated as the always-available fallback. Uses vLLM's stock `DefaultModelLoader` to download safetensors from HuggingFace Hub (or read them from the local HF cache), stage them through CPU, copy to GPU, then publish metadata so this worker can serve future targets via RDMA.
 
 ```mermaid
 sequenceDiagram
@@ -287,29 +272,122 @@ sequenceDiagram
     participant Storage as Storage Origin (HuggingFace / S3)
 
     Engine->>Client: load_model(model_name, identity)
+    Client->>Storage: HuggingFace Hub download (snapshot_download)
+    Storage-->>Client: safetensors files (local cache)
+    Client->>Client: DefaultModelLoader.load_weights() -- read files, CPU stage, copy to GPU
+    Client->>Client: process_weights_after_loading() (capture tensor attrs)
+    Client->>Client: register_tensors() -- init NIXL agent, register GPU buffers
+    Client->>Server: PublishMetadata(identity, worker, worker_id)
+    Server-->>Client: mx_source_id (status=INITIALIZING)
+    Client->>Client: Start HeartbeatThread
+    loop Every MX_HEARTBEAT_INTERVAL_SECS
+        Client->>Server: UpdateStatus(mx_source_id, worker_id, rank, READY)
+    end
+    Client-->>Engine: Model ready for inference
+    Note over Remote: Idle for this load -- this worker may later serve as a source<br/>for other workers' RdmaStrategy.
+```
+
+### GdsStrategy (GPUDirect Storage, file -> GPU direct read)
+
+Activated when `is_gds_available()` returns true. `MxGdsLoader` reads safetensors directly from disk into GPU memory, bypassing CPU staging. Falls through to the next strategy on failure.
+
+```mermaid
+sequenceDiagram
+    participant Engine as Inference Engine
+    participant Client as ModelExpress Client
+    participant Server as ModelExpress Server
+    participant Remote as Remote ModelExpress Worker
+    participant Storage as Storage Origin (HuggingFace / S3)
+
+    Engine->>Client: load_model(model_name, identity)
+    Client->>Client: is_gds_available() -- check GDS hardware/driver
+    Note over Storage: Files must already be on a GDS-capable filesystem.<br/>If not present, the operator pre-stages them out of band<br/>(this strategy does not download).
+    Client->>Storage: GDS read (cuFile) -- file -> GPU memory directly
+    Storage-->>Client: tensor bytes streamed into GPU buffers
+    Client->>Client: model.load_weights(weights_iter)
+    Client->>Client: process_weights_after_loading()
+    Client->>Client: register_tensors() -- init NIXL agent, register GPU buffers
+    Client->>Server: PublishMetadata(identity, worker, worker_id)
+    Server-->>Client: mx_source_id (status=INITIALIZING)
+    loop Every MX_HEARTBEAT_INTERVAL_SECS
+        Client->>Server: UpdateStatus(... READY)
+    end
+    Client-->>Engine: Model ready for inference
+    Note over Remote: Not contacted -- this worker will become a future RDMA source.
+```
+
+### ModelStreamerStrategy (`runai-model-streamer`, object storage / local)
+
+Activated when `MX_MODEL_URI` is set and `runai_model_streamer` is installed. Streams safetensors concurrently from `s3://`, `gs://`, `az://`, an absolute local path, or an HF model ID resolved via `HF_HUB_CACHE`.
+
+```mermaid
+sequenceDiagram
+    participant Engine as Inference Engine
+    participant Client as ModelExpress Client
+    participant Server as ModelExpress Server
+    participant Remote as Remote ModelExpress Worker
+    participant Storage as Storage Origin (HuggingFace / S3)
+
+    Engine->>Client: load_model(model_name, identity)
+    Client->>Client: _resolve_model_uri(MX_MODEL_URI) -- s3://, gs://, az://, /path, or HF id
+    Client->>Storage: list_safetensors(model_uri)
+    Storage-->>Client: file URI list
+    Client->>Storage: SafetensorsStreamer.stream_files(file_uris) -- concurrent reads
+    Storage-->>Client: tensor bytes (streamed, CPU-staged then GPU copy)
+    Client->>Client: model.load_weights(weights_iter) (clones each tensor)
+    Client->>Client: process_weights_after_loading()
+    Client->>Client: register_tensors() -- init NIXL agent, register GPU buffers
+    Client->>Server: PublishMetadata(identity, worker, worker_id)
+    Server-->>Client: mx_source_id (status=INITIALIZING)
+    loop Every MX_HEARTBEAT_INTERVAL_SECS
+        Client->>Server: UpdateStatus(... READY)
+    end
+    Client-->>Engine: Model ready for inference
+    Note over Remote: Not contacted -- this worker will become a future RDMA source.
+```
+
+### RdmaStrategy (NIXL P2P, receive from a READY same-rank source)
+
+Highest-priority strategy. Discovers an existing source via `ListSources`, fetches per-worker metadata, transfers fully-processed weights over RDMA (NIXL, optionally with a lightweight P2P manifest fetched directly from the source worker), then republishes its own metadata so it can serve later workers.
+
+```mermaid
+sequenceDiagram
+    participant Engine as Inference Engine
+    participant Client as ModelExpress Client
+    participant Server as ModelExpress Server
+    participant Remote as Remote ModelExpress Worker
+    participant Storage as Storage Origin (HuggingFace / S3)
+
+    Engine->>Client: load_model(model_name, identity)
+    Client->>Client: is_nixl_available() and check_transfer_allowed() (skip MLA)
     Client->>Server: ListSources(identity, status=READY)
     Server-->>Client: [SourceInstanceRef, ...]
-    Client->>Client: Filter by worker_rank, shuffle for load balancing
-    Client->>Client: Load dummy weights, initialize NIXL agent
-    loop For each candidate (max MAX_SOURCE_RETRIES)
+    Client->>Client: Filter by worker_rank, shuffle, take up to MAX_SOURCE_RETRIES
+    Client->>Client: DummyModelLoader.load_weights() + process_weights_after_loading()
+    Client->>Client: register_tensors() -- init NIXL agent, register GPU buffers
+    loop For each candidate
         Client->>Server: GetMetadata(mx_source_id, worker_id)
-        Server-->>Client: WorkerMetadata (tensors, nixl_metadata)
-        Client->>Client: Add remote NIXL agent
-        Client->>Remote: RDMA read tensors (NIXL / Mooncake)
-        Remote-->>Client: Tensor bytes via RDMA
-        alt Transfer fails (SourceTransferError)
-            Client->>Client: Try next candidate
+        Server-->>Client: WorkerMetadata (tensors or worker_grpc_endpoint, nixl_metadata, agent_name)
+        opt P2P mode (worker_grpc_endpoint set)
+            Client->>Remote: WorkerService.GetTensorManifest(mx_source_id)
+            Remote-->>Client: tensor descriptors
+            Client->>Remote: NIXL fetch_remote_metadata(host, port)
+            Remote-->>Client: NIXL agent metadata blob
+        end
+        Client->>Remote: NIXL RDMA read (GPU -> GPU, fully-processed tensors)
+        Remote-->>Client: tensor bytes via RDMA
+        alt SourceTransferError or ManifestMismatchError
+            Client->>Client: rollback NIXL state, try next candidate
+        else Success
+            Client->>Client: torch.cuda.synchronize()
         end
     end
-    alt No RDMA source available (fallback)
-        Client->>Storage: Fetch weights (HF Hub / S3 / GCS / Azure)
-        Storage-->>Client: Model files (safetensors)
+    Note over Storage: Not contacted on the RDMA happy path.<br/>If all candidates fail, MxModelLoader falls through to<br/>ModelStreamer / GDS / Default which read from Storage.
+    Client->>Server: PublishMetadata(identity, worker, worker_id) -- become a source
+    Server-->>Client: mx_source_id (status=INITIALIZING)
+    loop Every MX_HEARTBEAT_INTERVAL_SECS
+        Client->>Server: UpdateStatus(... READY)
     end
-    Client->>Engine: process_weights_after_loading()
-    Engine-->>Client: Post-processed tensors
-    Client->>Client: Register tensors with NIXL agent
-    Client->>Server: PublishMetadata (become a source)
-    Server-->>Client: mx_source_id
     Client-->>Engine: Model ready for inference
 ```
 
