@@ -253,46 +253,64 @@ status:
 
 ```mermaid
 sequenceDiagram
-    participant W as GPU Worker
-    participant MX as MX Server
-    participant Backend as Redis / K8s
+    participant Engine as Inference Engine
+    participant Client as ModelExpress Client
+    participant Server as ModelExpress Server
+    participant Storage as Storage Origin (HuggingFace / S3)
 
-    W->>W: Load weights from disk (or GDS)
-    W->>W: process_weights_after_loading()
-    W->>W: Collect all post-processed tensors
-    W->>W: Initialize NIXL agent, register tensors
-    W->>MX: PublishMetadata(identity, worker, worker_id)
-    MX->>Backend: Store worker metadata (status=INITIALIZING)
-    MX-->>W: mx_source_id
-    W->>W: Start HeartbeatThread
+    Engine->>Client: load_model(model_name, identity)
+    Client->>Storage: Fetch weights (HF Hub / S3 / GCS / Azure)
+    Storage-->>Client: Model files (safetensors)
+    Client->>Client: Load tensors to GPU (ModelStreamer / GDS / disk)
+    Client->>Engine: process_weights_after_loading()
+    Engine-->>Client: Post-processed tensors
+    Client->>Client: Initialize NIXL agent, register tensors
+    Client->>Server: PublishMetadata(identity, worker, worker_id)
+    Server->>Server: Store worker metadata (status=INITIALIZING)
+    Server-->>Client: mx_source_id
+    Client->>Client: Start HeartbeatThread
     loop Every MX_HEARTBEAT_INTERVAL_SECS
-        W->>MX: UpdateStatus(mx_source_id, worker_id, rank, READY)
-        MX->>Backend: Patch status + updated_at
+        Client->>Server: UpdateStatus(mx_source_id, worker_id, rank, READY)
+        Server->>Server: Patch status + updated_at
     end
+    Client-->>Engine: Model ready for inference
 ```
 
 ### Target Path (receive via RDMA)
 
 ```mermaid
 sequenceDiagram
-    participant W as GPU Worker
-    participant MX as MX Server
+    participant Engine as Inference Engine
+    participant Client as ModelExpress Client
+    participant Server as ModelExpress Server
+    participant Remote as Remote ModelExpress Worker
+    participant Storage as Storage Origin (HuggingFace / S3)
 
-    W->>MX: ListSources(identity, status=READY)
-    MX-->>W: [SourceInstanceRef, ...]
-    W->>W: Filter by worker_rank, shuffle for load balancing
-    W->>W: Load dummy weights, initialize NIXL agent
+    Engine->>Client: load_model(model_name, identity)
+    Client->>Server: ListSources(identity, status=READY)
+    Server-->>Client: [SourceInstanceRef, ...]
+    Client->>Client: Filter by worker_rank, shuffle for load balancing
+    Client->>Client: Load dummy weights, initialize NIXL agent
     loop For each candidate (max MAX_SOURCE_RETRIES)
-        W->>MX: GetMetadata(mx_source_id, worker_id)
-        MX-->>W: WorkerMetadata (tensors, nixl_metadata)
-        W->>W: Add remote NIXL agent
-        W->>W: Execute RDMA transfers
+        Client->>Server: GetMetadata(mx_source_id, worker_id)
+        Server-->>Client: WorkerMetadata (tensors, nixl_metadata)
+        Client->>Client: Add remote NIXL agent
+        Client->>Remote: RDMA read tensors (NIXL / Mooncake)
+        Remote-->>Client: Tensor bytes via RDMA
         alt Transfer fails (SourceTransferError)
-            W->>W: Try next candidate
+            Client->>Client: Try next candidate
         end
     end
-    W->>W: process_weights_after_loading()
-    W->>W: Register and publish own metadata (become a source)
+    alt No RDMA source available (fallback)
+        Client->>Storage: Fetch weights (HF Hub / S3 / GCS / Azure)
+        Storage-->>Client: Model files (safetensors)
+    end
+    Client->>Engine: process_weights_after_loading()
+    Engine-->>Client: Post-processed tensors
+    Client->>Client: Register tensors with NIXL agent
+    Client->>Server: PublishMetadata (become a source)
+    Server-->>Client: mx_source_id
+    Client-->>Engine: Model ready for inference
 ```
 
 ### Three-Tier Loading Strategy
